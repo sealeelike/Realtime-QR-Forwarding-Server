@@ -12,11 +12,13 @@
 - Display total number of users
 - Display number of live users
 - Display number of live Producer
+- Leaderboard
 
 ### User management
 - User id and password
 - Their channel id
 - Their customized bios
+- User contribution count
 
 ### Log
 - Record url with timestamp
