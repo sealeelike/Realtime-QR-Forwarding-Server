@@ -13,8 +13,14 @@
 - Display number of live users
 - Display number of live Producer
 
+### User management
+- User id
+- Their channel id
+- Their customized bios
+
 ### Log
 - Record url with timestamp
+- Record user login ip and time
 
 ### Live channel created by Producer
 - Receive {url, timestamp, channel id} real time and forword to paired cunsumer(s) with remaining available time (assume expire time variable is 10s)
