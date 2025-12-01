@@ -14,7 +14,7 @@
 - Display number of live Producer
 
 ### User management
-- User id
+- User id and password
 - Their channel id
 - Their customized bios
 
