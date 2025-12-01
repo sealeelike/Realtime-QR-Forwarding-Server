@@ -1,7 +1,7 @@
 ## Producer terminal
 - Access their camera and extract QRcode in real time.
 - Fetch the standard time
-- Send back to the server
+- Send back to the server (event driven, send if code change)
 
 ## Consumer terminal
 - Get the real time url with remaining time
