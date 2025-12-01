@@ -35,3 +35,8 @@
 
 ### Hall(Not considering at the moment)
 Providers and consumers can reach an agreement or even a deal in advance.
+
+
+---
+*some expections*
+- It it should be compatible with docker, CF worker, and so on.
