@@ -44,6 +44,7 @@
 - [x] IP rate limiting (100 req/min general, 10/5min for login)
 - [x] IP ban management
 - [x] Security event logging (file-based)
+- [x] Single-session enforcement (new login kicks old session)
 
 ### Database
 - [x] SQLite integration for persistence
