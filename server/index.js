@@ -8,10 +8,9 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 
-const { initOwner } = require('./database');
+const { initOwner, securityOps } = require('./db');
 const { authPlugin, verifyToken } = require('./auth');
 const userRoutes = require('./routes/user');
-const logger = require('./logger');
 
 const generateId = () => crypto.randomBytes(4).toString('hex');
 
@@ -63,7 +62,7 @@ fastify.register(fastifyRateLimit, {
   timeWindow: '1 minute',
   keyGenerator: (request) => request.ip,
   errorResponseBuilder: (request, context) => {
-    logger.security('rate_limit_exceeded', { ip: request.ip, url: request.url });
+    securityOps.log('rate_limit_exceeded', null, null, null, null, request.ip, { url: request.url });
     return {
       code: 429,
       error: 'Too Many Requests',

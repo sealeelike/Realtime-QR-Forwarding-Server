@@ -37,11 +37,20 @@ const btnOpenUrl = document.getElementById('btn-open-url');
 const channelIdInput = document.getElementById('channel-id-input');
 const passwordInput = document.getElementById('password-input');
 const btnJoin = document.getElementById('btn-join');
+const autoJumpCheckbox = document.getElementById('auto-jump-checkbox');
 
 let ws = null;
 let currentUrl = null;
 let expireTime = null;
 let timerInterval = null;
+
+// Load auto-jump preference from localStorage
+const savedAutoJump = localStorage.getItem('autoJumpEnabled');
+autoJumpCheckbox.checked = savedAutoJump === 'true';
+
+autoJumpCheckbox.addEventListener('change', () => {
+  localStorage.setItem('autoJumpEnabled', autoJumpCheckbox.checked);
+});
 
 const params = new URLSearchParams(window.location.search);
 const urlChannelId = params.get('channel');
@@ -123,6 +132,11 @@ function handleUrlUpdate(data) {
   
   expireTime = receivedAt + actualRemaining;
   timerEl.classList.remove('expired');
+  
+  // Auto-jump if enabled and remaining time > 3 seconds
+  if (autoJumpCheckbox.checked && actualRemaining > 3000) {
+    window.open(currentUrl, '_blank');
+  }
   
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(updateTimer, 100);

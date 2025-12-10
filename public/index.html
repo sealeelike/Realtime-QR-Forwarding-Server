@@ -10,17 +10,20 @@
     body.auth-ready { visibility: visible; }
     .current-user { float: right; padding: 10px; }
     .logout-btn { color: #d9534f; cursor: pointer; text-decoration: underline; }
-    .edit-btn { color: #4a90d9; cursor: pointer; text-decoration: underline; margin-left: 5px; }
+    .clickable-user { color: #4a90d9; cursor: pointer; text-decoration: underline; }
     .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
     .modal.active { display: flex; align-items: center; justify-content: center; }
-    .modal-content { background: white; padding: 20px; border-radius: 8px; max-width: 400px; width: 90%; }
+    .modal-content { background: white; padding: 20px; border-radius: 8px; max-width: 450px; width: 90%; }
     .modal-content h3 { margin-top: 0; }
-    .modal-content input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+    .modal-content input { width: 100%; padding: 10px; margin: 8px 0; box-sizing: border-box; }
     .modal-content .btn-row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 15px; }
-    .modal-content button { padding: 8px 16px; }
+    .modal-content button { padding: 8px 16px; cursor: pointer; }
     .modal-content .btn-primary { background: #4a90d9; color: white; border: none; }
     .modal-content .btn-cancel { background: #ddd; border: none; }
-    .username-info { font-size: 12px; color: #666; margin-top: 5px; }
+    .account-section { border: 1px solid #ddd; padding: 15px; border-radius: 6px; margin-bottom: 15px; }
+    .account-section h4 { margin: 0 0 10px 0; color: #333; }
+    .account-section.disabled { opacity: 0.5; pointer-events: none; }
+    .section-info { font-size: 12px; color: #666; margin-top: 5px; }
   </style>
 </head>
 <body>
@@ -30,37 +33,38 @@
     <a href="/consumer.html">Consumer</a>
     <span id="admin-nav"></span>
     <span class="current-user">
-      <span id="currentUser"></span>
-      <span class="edit-btn" id="editUsername" onclick="showUsernameModal()">Edit</span>
-      <span class="edit-btn" id="editPassword" onclick="showPasswordModal()">Password</span> | 
+      <span id="currentUser" class="clickable-user" onclick="showAccountModal()"></span> | 
       <span class="logout-btn" onclick="logout()">Logout</span>
     </span>
   </nav>
 
-  <!-- Username Change Modal -->
-  <div id="usernameModal" class="modal">
+  <!-- Account Settings Modal -->
+  <div id="accountModal" class="modal">
     <div class="modal-content">
-      <h3>Change Username</h3>
-      <input type="text" id="newUsername" placeholder="New username (min 3 characters)">
-      <p class="username-info" id="usernameInfo"></p>
-      <div class="btn-row">
-        <button class="btn-cancel" onclick="hideUsernameModal()">Cancel</button>
-        <button class="btn-primary" onclick="changeUsername()">Save</button>
+      <h3>Account Settings</h3>
+      
+      <div id="usernameSection" class="account-section">
+        <h4>Change Username</h4>
+        <input type="text" id="newUsername" placeholder="New username (min 3 characters)">
+        <p class="section-info" id="usernameInfo"></p>
+        <div class="btn-row">
+          <button class="btn-primary" onclick="changeUsername()">Update Username</button>
+        </div>
       </div>
-    </div>
-  </div>
-
-  <!-- Password Change Modal -->
-  <div id="passwordModal" class="modal">
-    <div class="modal-content">
-      <h3>Change Password</h3>
-      <input type="password" id="oldPassword" placeholder="Current password">
-      <input type="password" id="newPassword" placeholder="New password (min 6 characters)">
-      <input type="password" id="confirmPassword" placeholder="Confirm new password">
-      <p class="username-info" id="passwordInfo"></p>
+      
+      <div id="passwordSection" class="account-section">
+        <h4>Change Password</h4>
+        <input type="password" id="oldPassword" placeholder="Current password">
+        <input type="password" id="newPassword" placeholder="New password (min 6 characters)">
+        <input type="password" id="confirmPassword" placeholder="Confirm new password">
+        <p class="section-info" id="passwordInfo"></p>
+        <div class="btn-row">
+          <button class="btn-primary" onclick="changePassword()">Update Password</button>
+        </div>
+      </div>
+      
       <div class="btn-row">
-        <button class="btn-cancel" onclick="hidePasswordModal()">Cancel</button>
-        <button class="btn-primary" onclick="changePassword()">Save</button>
+        <button class="btn-cancel" onclick="hideAccountModal()">Close</button>
       </div>
     </div>
   </div>
@@ -110,23 +114,8 @@
         
         document.body.classList.add('auth-ready');
         
-        // Update username info based on role
-        const infoEl = document.getElementById('usernameInfo');
-        if (currentUser.role === 'user') {
-          if (currentUser.usernameChanged) {
-            infoEl.textContent = 'You have already changed your username once.';
-            document.getElementById('editUsername').style.display = 'none';
-          } else {
-            infoEl.textContent = 'Note: You can only change your username once.';
-          }
-        } else {
-          infoEl.textContent = 'As ' + currentUser.role + ', you can change your username unlimited times.';
-        }
-        
-        // Hide password button if already changed this session
-        if (currentUser.passwordChangedThisSession) {
-          document.getElementById('editPassword').style.display = 'none';
-        }
+        // Setup account modal sections based on user state
+        setupAccountModalState();
       } catch {
         window.location.href = '/login.html';
       }
@@ -137,25 +126,47 @@
       window.location.href = '/login.html';
     }
 
-    function showUsernameModal() {
+    function setupAccountModalState() {
+      const usernameSection = document.getElementById('usernameSection');
+      const passwordSection = document.getElementById('passwordSection');
+      const usernameInfo = document.getElementById('usernameInfo');
+      const passwordInfo = document.getElementById('passwordInfo');
+      
+      // Username section
+      if (currentUser.role === 'user') {
+        if (currentUser.usernameChanged) {
+          usernameSection.classList.add('disabled');
+          usernameInfo.textContent = 'You have already changed your username once.';
+        } else {
+          usernameSection.classList.remove('disabled');
+          usernameInfo.textContent = 'Note: You can only change your username once.';
+        }
+      } else {
+        usernameSection.classList.remove('disabled');
+        usernameInfo.textContent = 'As ' + currentUser.role + ', you can change your username unlimited times.';
+      }
+      
+      // Password section
+      if (currentUser.passwordChangedThisSession) {
+        passwordSection.classList.add('disabled');
+        passwordInfo.textContent = 'You have already changed your password this session.';
+      } else {
+        passwordSection.classList.remove('disabled');
+        passwordInfo.textContent = 'You can only change password once per session.';
+      }
+    }
+
+    function showAccountModal() {
       document.getElementById('newUsername').value = currentUser.username;
-      document.getElementById('usernameModal').classList.add('active');
-    }
-
-    function hideUsernameModal() {
-      document.getElementById('usernameModal').classList.remove('active');
-    }
-
-    function showPasswordModal() {
       document.getElementById('oldPassword').value = '';
       document.getElementById('newPassword').value = '';
       document.getElementById('confirmPassword').value = '';
-      document.getElementById('passwordInfo').textContent = 'You can only change password once per session.';
-      document.getElementById('passwordModal').classList.add('active');
+      setupAccountModalState();
+      document.getElementById('accountModal').classList.add('active');
     }
 
-    function hidePasswordModal() {
-      document.getElementById('passwordModal').classList.remove('active');
+    function hideAccountModal() {
+      document.getElementById('accountModal').classList.remove('active');
     }
 
     async function changePassword() {
@@ -185,8 +196,8 @@
       const data = await res.json();
       if (data.success) {
         alert('Password changed successfully');
-        hidePasswordModal();
-        document.getElementById('editPassword').style.display = 'none';
+        currentUser.passwordChangedThisSession = true;
+        setupAccountModalState();
       } else {
         alert(data.error || 'Failed to change password');
       }
@@ -207,8 +218,11 @@
       
       const data = await res.json();
       if (data.success) {
-        hideUsernameModal();
-        window.location.reload();
+        currentUser.username = newUsername;
+        if (currentUser.role === 'user') currentUser.usernameChanged = true;
+        document.getElementById('currentUser').textContent = `${currentUser.username} (${currentUser.role})`;
+        setupAccountModalState();
+        alert('Username changed successfully');
       } else {
         alert(data.error || 'Failed to change username');
       }

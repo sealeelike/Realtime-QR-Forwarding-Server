@@ -1,19 +1,29 @@
 const jwt = require('jsonwebtoken');
 const fp = require('fastify-plugin');
-const { userOps, ipOps, ROLES } = require('./database');
-const logger = require('./logger');
-
 const crypto = require('crypto');
+
+const { 
+  ROLES, 
+  userOps, 
+  ipOps, 
+  userBanOps, 
+  loginOps, 
+  securityOps,
+  sessionOps,
+  verifyPasswordSync 
+} = require('./db');
+
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production-' + crypto.randomBytes(16).toString('hex');
 const JWT_EXPIRES = process.env.JWT_EXPIRES || '24h';
 const MAX_LOGIN_FAILURES = 4;
-
-function generateSessionToken() {
-  return crypto.randomBytes(16).toString('hex');
-}
+const FAILURE_WINDOW_SECONDS = 3600; // 1 hour
 
 if (!process.env.JWT_SECRET) {
   console.warn('WARNING: JWT_SECRET not set. Using random secret (sessions will invalidate on restart).');
+}
+
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
 }
 
 function createToken(user, sessionToken, options = {}) {
@@ -39,37 +49,49 @@ function verifyToken(token) {
   }
 }
 
-function login(username, password, ip) {
+function login(username, password, ip, userAgent = null) {
   // Check if IP is banned
-  const bannedIp = ipOps.isBanned.get(ip);
+  const bannedIp = ipOps.isBanned(ip);
   if (bannedIp) {
-    logger.security('login_blocked_ip', { username, ip });
+    securityOps.log('login_blocked_ip', username, null, null, null, ip, { reason: 'ip_banned' });
     return { success: false, error: 'IP banned', code: 'IP_BANNED' };
   }
 
-  const user = userOps.findByUsername.get(username);
+  const user = userOps.findByUsername(username);
   
   if (!user) {
-    logger.security('login_failed_unknown_user', { username, ip });
+    loginOps.record(null, username, ip, false, 'unknown_user');
+    securityOps.log('login_failed', username, null, null, null, ip, { reason: 'unknown_user' });
     return { success: false, error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' };
   }
 
   // Check if user is banned
-  if (user.is_banned) {
-    logger.security('login_blocked_banned_user', { username, ip, userId: user.id });
+  const userBan = userBanOps.isBanned(user.id);
+  if (userBan) {
+    loginOps.record(user.id, username, ip, false, 'user_banned');
+    securityOps.log('login_blocked_banned', user.username, user.id, null, null, ip, { banId: userBan.id });
     return { success: false, error: 'Account banned', code: 'ACCOUNT_BANNED' };
   }
 
-  // Check password (plain text for now, TODO: bcrypt)
-  if (user.password !== password) {
-    const failures = user.login_failures + 1;
-    userOps.updateLoginFailures.run(failures, user.id);
+  // Check password
+  if (!verifyPasswordSync(password, user.password_hash)) {
+    loginOps.record(user.id, username, ip, false, 'wrong_password');
     
-    logger.security('login_failed', { username, ip, userId: user.id, failures });
+    // Check recent failures
+    const failures = loginOps.getRecentFailures(user.id, FAILURE_WINDOW_SECONDS);
+    const failureCount = failures.count + 1;
+    
+    securityOps.log('login_failed', user.username, user.id, null, null, ip, { 
+      reason: 'wrong_password', 
+      failures: failureCount 
+    });
 
-    if (failures >= MAX_LOGIN_FAILURES) {
-      userOps.banUser.run(user.id);
-      logger.security('user_auto_banned', { username, ip, userId: user.id, reason: 'Too many login failures' });
+    if (failureCount >= MAX_LOGIN_FAILURES) {
+      userBanOps.ban(user.id, user.username, 'Too many login failures', 'system');
+      securityOps.log('user_auto_banned', user.username, user.id, null, null, ip, { 
+        reason: 'too_many_failures',
+        failures: failureCount
+      });
       return { success: false, error: 'Account banned due to too many failed attempts', code: 'ACCOUNT_BANNED' };
     }
 
@@ -77,19 +99,23 @@ function login(username, password, ip) {
       success: false, 
       error: 'Invalid credentials', 
       code: 'INVALID_CREDENTIALS',
-      remainingAttempts: MAX_LOGIN_FAILURES - failures
+      remainingAttempts: MAX_LOGIN_FAILURES - failureCount
     };
   }
 
-  // Reset login failures on successful login
-  userOps.updateLoginFailures.run(0, user.id);
-  userOps.updateLastLogin.run(Date.now(), user.id);
+  // Login successful - clear previous failures
+  loginOps.clearFailures(user.id);
+  loginOps.record(user.id, username, ip, true, null);
   
-  // Generate new session token (kicks off old sessions)
+  // Invalidate old sessions (single session enforcement)
+  sessionOps.invalidateAllForUser(user.id, 'new_login');
+  
+  // Create new session
   const sessionToken = generateSessionToken();
-  userOps.updateSessionToken.run(sessionToken, user.id);
+  const expiresAt = Math.floor(Date.now() / 1000) + (24 * 60 * 60); // 24 hours
+  sessionOps.create(sessionToken, user.id, user.username, ip, userAgent, expiresAt);
   
-  logger.security('login_success', { username, ip, userId: user.id });
+  securityOps.log('login_success', user.username, user.id, null, null, ip, null);
 
   const token = createToken(user, sessionToken);
   return {
@@ -104,15 +130,19 @@ function login(username, password, ip) {
   };
 }
 
-function changePassword(userId, oldPassword, newPassword) {
-  const user = userOps.findById.get(userId);
+function changePassword(userId, oldPassword, newPassword, ip = null) {
+  const { hashPasswordSync } = require('./db');
+  
+  const user = userOps.findById(userId);
   if (!user) {
     return { success: false, error: 'User not found' };
   }
 
   // Verify old password (skip for must_change_password on first login)
-  if (!user.must_change_password && user.password !== oldPassword) {
-    logger.security('password_change_failed', { userId, reason: 'wrong_old_password' });
+  if (!user.must_change_password && !verifyPasswordSync(oldPassword, user.password_hash)) {
+    securityOps.log('password_change_failed', user.username, user.id, null, null, ip, { 
+      reason: 'wrong_old_password' 
+    });
     return { success: false, error: 'Current password is incorrect' };
   }
 
@@ -120,13 +150,18 @@ function changePassword(userId, oldPassword, newPassword) {
     return { success: false, error: 'Password must be at least 6 characters' };
   }
 
-  userOps.updatePassword.run(newPassword, userId);
-  logger.userAction('password_changed', { userId, username: user.username });
+  const newHash = hashPasswordSync(newPassword);
+  userOps.updatePassword(newHash, userId);
   
-  // Return new token without mustChangePassword flag (keep same session token)
-  // Mark passwordChangedThisSession to prevent multiple changes per session
-  const updatedUser = userOps.findById.get(userId);
-  const token = createToken(updatedUser, updatedUser.session_token, { passwordChangedThisSession: true });
+  securityOps.log('password_changed', user.username, user.id, null, null, ip, null);
+  
+  // Get current active session
+  const sessions = sessionOps.getActiveForUser(userId);
+  const currentSessionToken = sessions.length > 0 ? sessions[0].token : generateSessionToken();
+  
+  // Return new token with passwordChangedThisSession flag
+  const updatedUser = userOps.findById(userId);
+  const token = createToken(updatedUser, currentSessionToken, { passwordChangedThisSession: true });
   
   return { success: true, token };
 }
@@ -169,8 +204,11 @@ function authPlugin(fastify, opts, done) {
           return reply.redirect('/login.html');
         }
         // Check if user is banned or session invalidated
-        const user = userOps.findById.get(payload.id);
-        if (!user || user.is_banned || user.session_token !== payload.sessionToken) {
+        const user = userOps.findById(payload.id);
+        const isBanned = userBanOps.isBanned(payload.id);
+        const session = sessionOps.find(payload.sessionToken);
+        
+        if (!user || isBanned || !session) {
           reply.clearCookie('token', { path: '/' });
           return reply.redirect('/login.html');
         }
@@ -194,12 +232,17 @@ function authPlugin(fastify, opts, done) {
       return reply.code(401).send({ error: 'Invalid or expired token' });
     }
 
-    // Check if user still exists, not banned, and session is valid
-    const user = userOps.findById.get(payload.id);
-    if (!user || user.is_banned) {
+    // Check if user still exists and not banned
+    const user = userOps.findById(payload.id);
+    const isBanned = userBanOps.isBanned(payload.id);
+    
+    if (!user || isBanned) {
       return reply.code(401).send({ error: 'Account not available' });
     }
-    if (user.session_token !== payload.sessionToken) {
+    
+    // Check if session is still valid
+    const session = sessionOps.find(payload.sessionToken);
+    if (!session) {
       return reply.code(401).send({ error: 'Session expired (logged in elsewhere)', code: 'SESSION_EXPIRED' });
     }
 
@@ -216,9 +259,7 @@ function requireRole(role) {
       return reply.code(401).send({ error: 'Authentication required' });
     }
     if (!hasRole(request.user.role, role)) {
-      logger.security('unauthorized_access', { 
-        userId: request.user.id, 
-        username: request.user.username,
+      securityOps.log('unauthorized_access', request.user.username, request.user.id, null, null, request.ip, {
         requiredRole: role,
         userRole: request.user.role,
         path: request.url
@@ -234,7 +275,7 @@ module.exports = {
   login,
   changePassword,
   hasRole,
-  authPlugin: fp(authPlugin),  // Wrap with fastify-plugin to expose hooks
+  authPlugin: fp(authPlugin),
   requireRole,
   JWT_SECRET
 };

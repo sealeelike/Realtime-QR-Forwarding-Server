@@ -1,27 +1,36 @@
-const { userOps, ipOps, ROLES, generateUsername, generatePassword } = require('../database');
+const { 
+  userOps, 
+  ipOps, 
+  userBanOps,
+  securityOps,
+  actionOps,
+  ROLES, 
+  generateUsername, 
+  generatePassword,
+  hashPasswordSync
+} = require('../db');
 const { login, changePassword, requireRole, hasRole } = require('../auth');
-const logger = require('../logger');
 
 async function userRoutes(fastify) {
   // Login
   fastify.post('/api/auth/login', async (request, reply) => {
     const { username, password } = request.body || {};
     const ip = request.ip;
+    const userAgent = request.headers['user-agent'];
 
     if (!username || !password) {
       return reply.code(400).send({ error: 'Username and password required' });
     }
 
-    const result = login(username, password, ip);
+    const result = login(username, password, ip, userAgent);
     
     if (result.success) {
-      // Set cookie
       reply.setCookie('token', result.token, {
         path: '/',
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'strict',
-        maxAge: 24 * 60 * 60 // 24 hours
+        maxAge: 24 * 60 * 60
       });
     }
 
@@ -39,8 +48,7 @@ async function userRoutes(fastify) {
     if (!request.user) {
       return reply.code(401).send({ error: 'Not authenticated' });
     }
-    // Get fresh data from database (not from token)
-    const dbUser = userOps.findById.get(request.user.id);
+    const dbUser = userOps.findById(request.user.id);
     return { 
       user: {
         ...request.user,
@@ -60,7 +68,6 @@ async function userRoutes(fastify) {
       return reply.code(401).send({ error: 'Not authenticated' });
     }
 
-    // Check if password was already changed in this session
     if (request.user.passwordChangedThisSession) {
       return reply.code(403).send({ error: 'Password can only be changed once per session. Please re-login to change again.' });
     }
@@ -73,15 +80,14 @@ async function userRoutes(fastify) {
       return reply.code(400).send({ error: 'Passwords do not match' });
     }
 
-    // For first login (must change password), oldPassword can be empty
-    const user = userOps.findById.get(request.user.id);
+    const user = userOps.findById(request.user.id);
     const needOldPassword = !user.must_change_password;
 
     if (needOldPassword && !oldPassword) {
       return reply.code(400).send({ error: 'Current password required' });
     }
 
-    const result = changePassword(request.user.id, oldPassword || user.password, newPassword);
+    const result = changePassword(request.user.id, oldPassword || '', newPassword, request.ip);
     
     if (result.success) {
       reply.setCookie('token', result.token, {
@@ -114,7 +120,7 @@ async function userRoutes(fastify) {
     // Admin daily limit: 3 users per day (owner unlimited)
     if (request.user.role === 'admin') {
       const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-      const created = userOps.countCreatedToday.get(request.user.username, todayStart);
+      const created = userOps.countCreatedToday(request.user.username, todayStart);
       if (created.count >= 3) {
         return reply.code(403).send({ error: 'Daily limit reached. Admins can only create 3 users per day.' });
       }
@@ -122,15 +128,21 @@ async function userRoutes(fastify) {
 
     const username = generateUsername();
     const password = generatePassword();
+    const passwordHash = hashPasswordSync(password);
 
     try {
-      userOps.create.run(username, password, role, 1, request.user.username);
+      userOps.create(username, passwordHash, role, 1, request.user.username);
       
-      logger.userAction('user_created', {
-        createdBy: request.user.username,
-        newUsername: username,
-        role
-      });
+      actionOps.log(
+        request.user.id, 
+        request.user.username, 
+        'user_created', 
+        'user', 
+        null, 
+        username, 
+        { role },
+        request.ip
+      );
 
       return {
         success: true,
@@ -144,30 +156,62 @@ async function userRoutes(fastify) {
 
   // List users (admin+)
   fastify.get('/api/admin/users', { preHandler: requireRole('admin') }, async (request) => {
-    const users = userOps.listAll.all();
-    return { users };
+    const isOwner = request.user.role === 'owner';
+    const users = userOps.listAll(isOwner);
+    
+    // Add ban status and login failures from security db
+    const usersWithStatus = users.map(user => {
+      const banInfo = userBanOps.isBanned(user.id);
+      const { loginOps } = require('../db');
+      const failures = loginOps.getRecentFailures(user.id, 3600);
+      
+      return {
+        ...user,
+        is_banned: !!banInfo,
+        login_failures: failures.count,
+        // notes is already included/excluded by listAll based on isOwner
+      };
+    });
+    
+    return { users: usersWithStatus };
   });
 
   // Ban user (admin+)
   fastify.post('/api/admin/users/:id/ban', { preHandler: requireRole('admin') }, async (request, reply) => {
     const userId = parseInt(request.params.id);
-    const user = userOps.findById.get(userId);
+    const { reason } = request.body || {};
+    const user = userOps.findById(userId);
 
     if (!user) {
       return reply.code(404).send({ error: 'User not found' });
     }
 
-    // Can't ban users with equal or higher role
-    if (ROLES[user.role] >= ROLES[request.user.role]) {
-      return reply.code(403).send({ error: 'Cannot ban user with equal or higher role' });
+    // Admin can ONLY ban users (not admin or owner)
+    // Owner can ban users and admins (but not other owners)
+    if (request.user.role === 'admin') {
+      if (user.role !== 'user') {
+        return reply.code(403).send({ error: 'Admins can only ban regular users' });
+      }
+    } else if (request.user.role === 'owner') {
+      if (user.role === 'owner') {
+        return reply.code(403).send({ error: 'Cannot ban owner accounts' });
+      }
     }
 
-    userOps.banUser.run(userId);
-    logger.userAction('user_banned', {
-      bannedBy: request.user.username,
-      targetUser: user.username,
-      targetUserId: userId
-    });
+    userBanOps.ban(userId, user.username, reason || 'Manual ban', request.user.username);
+    
+    actionOps.log(
+      request.user.id,
+      request.user.username,
+      'user_banned',
+      'user',
+      userId,
+      user.username,
+      { reason },
+      request.ip
+    );
+
+    securityOps.log('user_banned', request.user.username, request.user.id, user.username, userId, request.ip, { reason });
 
     return { success: true };
   });
@@ -175,18 +219,28 @@ async function userRoutes(fastify) {
   // Unban user (admin+)
   fastify.post('/api/admin/users/:id/unban', { preHandler: requireRole('admin') }, async (request, reply) => {
     const userId = parseInt(request.params.id);
-    const user = userOps.findById.get(userId);
+    const user = userOps.findById(userId);
 
     if (!user) {
       return reply.code(404).send({ error: 'User not found' });
     }
 
-    userOps.unbanUser.run(userId);
-    logger.userAction('user_unbanned', {
-      unbannedBy: request.user.username,
-      targetUser: user.username,
-      targetUserId: userId
-    });
+    userBanOps.unban(userId, request.user.username);
+    
+    // Clear login failures
+    const { loginOps } = require('../db');
+    loginOps.clearFailures(userId);
+    
+    actionOps.log(
+      request.user.id,
+      request.user.username,
+      'user_unbanned',
+      'user',
+      userId,
+      user.username,
+      null,
+      request.ip
+    );
 
     return { success: true };
   });
@@ -194,7 +248,7 @@ async function userRoutes(fastify) {
   // Delete user (admin+, only regular users)
   fastify.delete('/api/admin/users/:id', { preHandler: requireRole('admin') }, async (request, reply) => {
     const userId = parseInt(request.params.id);
-    const user = userOps.findById.get(userId);
+    const user = userOps.findById(userId);
 
     if (!user) {
       return reply.code(404).send({ error: 'User not found' });
@@ -204,12 +258,18 @@ async function userRoutes(fastify) {
       return reply.code(403).send({ error: 'Can only delete regular users' });
     }
 
-    userOps.deleteUser.run(userId);
-    logger.userAction('user_deleted', {
-      deletedBy: request.user.username,
-      targetUser: user.username,
-      targetUserId: userId
-    });
+    userOps.deleteUser(userId);
+    
+    actionOps.log(
+      request.user.id,
+      request.user.username,
+      'user_deleted',
+      'user',
+      userId,
+      user.username,
+      null,
+      request.ip
+    );
 
     return { success: true };
   });
@@ -224,12 +284,9 @@ async function userRoutes(fastify) {
       return reply.code(400).send({ error: 'IP address required' });
     }
 
-    ipOps.ban.run(ip, reason || 'Manual ban', request.user.username);
-    logger.security('ip_banned', {
-      bannedBy: request.user.username,
-      ip,
-      reason
-    });
+    ipOps.ban(ip, reason || 'Manual ban', request.user.username);
+    
+    securityOps.log('ip_banned', request.user.username, request.user.id, ip, null, request.ip, { reason });
 
     return { success: true };
   });
@@ -238,31 +295,40 @@ async function userRoutes(fastify) {
   fastify.delete('/api/admin/ip-bans/:ip', { preHandler: requireRole('admin') }, async (request, reply) => {
     const ip = request.params.ip;
 
-    ipOps.unban.run(ip);
-    logger.security('ip_unbanned', {
-      unbannedBy: request.user.username,
-      ip
-    });
+    ipOps.unban(ip);
+    
+    securityOps.log('ip_unbanned', request.user.username, request.user.id, ip, null, request.ip, null);
 
     return { success: true };
   });
 
   // List banned IPs (admin+)
   fastify.get('/api/admin/ip-bans', { preHandler: requireRole('admin') }, async () => {
-    const bans = ipOps.listAll.all();
+    const bans = ipOps.listAll();
     return { bans };
   });
 
   // === Logs (owner only) ===
   fastify.get('/api/admin/logs/:type', { preHandler: requireRole('owner') }, async (request, reply) => {
     const { type } = request.params;
-    const validTypes = ['security', 'user-actions', 'access'];
+    const limit = parseInt(request.query.limit) || 200;
     
-    if (!validTypes.includes(type)) {
-      return reply.code(400).send({ error: 'Invalid log type' });
+    let logs;
+    switch (type) {
+      case 'security':
+        logs = securityOps.getRecent(limit);
+        break;
+      case 'user-actions':
+        logs = actionOps.getRecent(limit);
+        break;
+      case 'access':
+        const { accessOps } = require('../db');
+        logs = accessOps.getRecent(limit);
+        break;
+      default:
+        return reply.code(400).send({ error: 'Invalid log type. Use: security, user-actions, access' });
     }
 
-    const logs = logger.readLogs(type, 200);
     return { logs };
   });
 
@@ -270,7 +336,7 @@ async function userRoutes(fastify) {
   fastify.put('/api/admin/users/:id/role', { preHandler: requireRole('owner') }, async (request, reply) => {
     const userId = parseInt(request.params.id);
     const { role } = request.body || {};
-    const user = userOps.findById.get(userId);
+    const user = userOps.findById(userId);
 
     if (!user) {
       return reply.code(404).send({ error: 'User not found' });
@@ -284,13 +350,19 @@ async function userRoutes(fastify) {
       return reply.code(400).send({ error: 'Invalid role. Must be admin or user' });
     }
 
-    userOps.updateRole.run(role, userId);
-    logger.userAction('role_changed', {
-      changedBy: request.user.username,
-      targetUser: user.username,
-      oldRole: user.role,
-      newRole: role
-    });
+    const oldRole = user.role;
+    userOps.updateRole(role, userId);
+    
+    actionOps.log(
+      request.user.id,
+      request.user.username,
+      'role_changed',
+      'user',
+      userId,
+      user.username,
+      { oldRole, newRole: role },
+      request.ip
+    );
 
     return { success: true, message: `User ${user.username} is now ${role}` };
   });
@@ -299,17 +371,24 @@ async function userRoutes(fastify) {
   fastify.put('/api/admin/users/:id/notes', { preHandler: requireRole('owner') }, async (request, reply) => {
     const userId = parseInt(request.params.id);
     const { notes } = request.body || {};
-    const user = userOps.findById.get(userId);
+    const user = userOps.findById(userId);
 
     if (!user) {
       return reply.code(404).send({ error: 'User not found' });
     }
 
-    userOps.updateNotes.run(notes || '', userId);
-    logger.userAction('notes_updated', {
-      updatedBy: request.user.username,
-      targetUser: user.username
-    });
+    userOps.updateNotes(notes || '', userId);
+    
+    actionOps.log(
+      request.user.id,
+      request.user.username,
+      'notes_updated',
+      'user',
+      userId,
+      user.username,
+      null,
+      request.ip
+    );
 
     return { success: true };
   });
@@ -328,24 +407,29 @@ async function userRoutes(fastify) {
 
     const trimmedUsername = newUsername.trim();
     
-    // Check if username is taken
-    const existing = userOps.findByUsername.get(trimmedUsername);
+    const existing = userOps.findByUsername(trimmedUsername);
     if (existing && existing.id !== request.user.id) {
       return reply.code(400).send({ error: 'Username already taken' });
     }
 
-    // Check if user can change username (owner/admin unlimited, regular user only once)
-    const currentUser = userOps.findById.get(request.user.id);
+    const currentUser = userOps.findById(request.user.id);
     if (currentUser.role === 'user' && currentUser.username_changed) {
       return reply.code(403).send({ error: 'You can only change your username once' });
     }
 
-    userOps.updateUsername.run(trimmedUsername, request.user.id);
-    logger.userAction('username_changed', {
-      userId: request.user.id,
-      oldUsername: currentUser.username,
-      newUsername: trimmedUsername
-    });
+    const oldUsername = currentUser.username;
+    userOps.updateUsername(trimmedUsername, request.user.id);
+    
+    actionOps.log(
+      request.user.id,
+      oldUsername,
+      'username_changed',
+      'user',
+      request.user.id,
+      trimmedUsername,
+      { oldUsername },
+      request.ip
+    );
 
     return { success: true, newUsername: trimmedUsername };
   });
